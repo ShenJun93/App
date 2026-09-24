@@ -1,5 +1,4 @@
 import {_buildSortKey, _sortCategorizedReports} from '@libs/SidebarUtils';
-import {localeCompare} from '../utils/TestHelper';
 
 type MiniReport = {
     reportID?: string;
@@ -8,41 +7,85 @@ type MiniReport = {
     lastVisibleActionCreated?: string;
 };
 
+const COLLATOR_OPTIONS: Intl.CollatorOptions = {usage: 'sort', sensitivity: 'variant', numeric: true, caseFirst: 'upper'};
+
+const collatorFor = (locale: string) => new Intl.Collator(locale, COLLATOR_OPTIONS).compare;
+
 const toMiniReport = (displayName: string, reportID: string): MiniReport => ({
     reportID,
     displayName,
     sortKey: _buildSortKey(displayName),
 });
 
-const emptyCategories = {
-    pinnedAndGBRReports: [] as MiniReport[],
-    errorReports: [] as MiniReport[],
-    draftReports: [] as MiniReport[],
-    nonArchivedReports: [] as MiniReport[],
-    archivedReports: [] as MiniReport[],
-};
+const sortPinned = (names: string[], locale: string) =>
+    _sortCategorizedReports(
+        {
+            pinnedAndGBRReports: names.map((name, index) => toMiniReport(name, String(index))),
+            errorReports: [],
+            draftReports: [],
+            nonArchivedReports: [],
+            archivedReports: [],
+        },
+        true,
+        collatorFor(locale),
+    ).pinnedAndGBRReports.map((report) => report.displayName);
+
+// Names taken verbatim from the report on Expensify/App#100959.
+const REPORTED_NAMES = ['Nuevo Budget', 'Ñu Safari', 'Zote Report'];
 
 describe('LHN sorting with locale-specific letters', () => {
-    it('orders pinned chats whose names contain accented letters by locale, not by code unit', () => {
-        // Given three pinned chats named as in the bug report, where one name starts with "Ñ" (U+00F1).
-        // "Ñ" has a higher code unit than "z" (U+007A), so a raw < / > comparison misplaces it after "Zote".
-        const reports = [toMiniReport('Nuevo Budget', '1'), toMiniReport('Ñu Safari', '2'), toMiniReport('Zote Report', '3')];
+    describe('the reported defect', () => {
+        it.each(['es', 'en', 'vi', 'de'])('never places an accented name after an unrelated later letter (%s)', (locale) => {
+            // Given the chat names from the report, one of which starts with "Ñ" (U+00F1).
+            // When the pinned list is sorted
+            const sorted = sortPinned(REPORTED_NAMES, locale);
 
-        // When the pinned category is sorted
-        const sorted = _sortCategorizedReports({...emptyCategories, pinnedAndGBRReports: reports}, true, localeCompare);
+            // Then "Ñu Safari" must come before "Zote Report" in every locale, because no locale
+            // orders "Ñ" after "Z". Comparing by UTF-16 code unit does, since 241 > 122.
+            expect(sorted.indexOf('Ñu Safari')).toBeLessThan(sorted.indexOf('Zote Report'));
+        });
 
-        // Then the order must follow locale collation, where "Ñ" sorts next to "N" and before "Z"
-        expect(sorted.pinnedAndGBRReports.map((report) => report.displayName)).toEqual(['Nuevo Budget', 'Ñu Safari', 'Zote Report']);
+        it('matches the order the reporter expected under Spanish collation', () => {
+            // Given Spanish names and a Spanish collator, where "Ñ" is a letter in its own right
+            // that sorts immediately after "N".
+            // Then the expected order from the issue is produced.
+            expect(sortPinned(REPORTED_NAMES, 'es')).toEqual(['Nuevo Budget', 'Ñu Safari', 'Zote Report']);
+        });
+
+        it('treats the accent as a variant of "n" under English collation', () => {
+            // Given the same names under English collation, where "Ñ" is an accented "N" rather than
+            // a separate letter, the relative order of the two "N" names legitimately differs.
+            // This documents that the three-way order is locale-dependent by design; only the
+            // "Ñ after Z" placement is unconditionally wrong.
+            expect(sortPinned(REPORTED_NAMES, 'en')).toEqual(['Ñu Safari', 'Nuevo Budget', 'Zote Report']);
+        });
     });
 
-    it('does not reach the locale-aware fallback for distinct names', () => {
-        // Given two distinct names, one accented
-        const accentedKey = _buildSortKey('Ñu Safari');
-        const plainKey = _buildSortKey('Zote Report');
+    describe('why the current comparator cannot get this right', () => {
+        it('never reaches the locale-aware fallback for distinct names', () => {
+            // Given two distinct names, one accented
+            const accentedKey = _buildSortKey('Ñu Safari');
+            const plainKey = _buildSortKey('Zote Report');
 
-        // Then their sort keys differ, so the comparator resolves on < / > and never calls localeCompare.
-        // This is why the Collator fallback in sortCategorizedReports is effectively unreachable.
-        expect(accentedKey).not.toEqual(plainKey);
-        expect(accentedKey > plainKey).toBe(true);
+            // Then their sort keys differ, so compareDisplayNames resolves on the < / > branch and
+            // the Collator fallback below it is unreachable.
+            expect(accentedKey).not.toEqual(plainKey);
+            expect(accentedKey > plainKey).toBe(true);
+        });
+
+        it('cannot be fixed by stripping accents, because that erases locale-specific letters', () => {
+            // Given a key built by stripping diacritics, as a lighter fix would do
+            const strip = (name: string) =>
+                name
+                    .toLowerCase()
+                    .normalize('NFD')
+                    .replace(/[̀-ͯ]/g, '');
+
+            // Then "Ñ" becomes indistinguishable from "N", so Spanish ordering can no longer be
+            // expressed: Spanish requires "Nuevo" before "Ñu", stripping forces the opposite.
+            const stripped = [...REPORTED_NAMES].sort((a, b) => (strip(a) < strip(b) ? -1 : strip(a) > strip(b) ? 1 : 0));
+            expect(stripped).toEqual(['Ñu Safari', 'Nuevo Budget', 'Zote Report']);
+            expect(stripped).not.toEqual(['Nuevo Budget', 'Ñu Safari', 'Zote Report']);
+        });
     });
 });
